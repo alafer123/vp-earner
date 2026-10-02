@@ -1,0 +1,20 @@
+{
+  "name": "vp-earner",
+  "version": "1.0.0",
+  "description": "Autonomous ACP provider agent on Base earning USDC via Virtuals Protocol marketplace",
+  "main": "dist/run-cycle.js",
+  "scripts": {
+    "run": "node dist/run-cycle.js",
+    "dev": "tsx run-cycle.ts",
+    "test": "node dist/run-cycle.js"
+  },
+  "keywords": ["virtuals-protocol", "base-chain", "acp", "autonomous-agent", "web3", "earn"],
+  "type": "commonjs",
+  "dependencies": {
+    "@virtuals-protocol/acp-node-v2": "^0.1.12",
+    "dotenv": "^17.4.2"
+  },
+  "devDependencies": {
+    "tsx": "^4.23.13"
+  }
+}
