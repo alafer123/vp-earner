@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Local environment (NEVER commit real credentials)
+.env
+.env.*
+!.env.example
+!.env.reference
+
+# Compiled output — included so the agent is runnable as-is
+# dist/
+
+# Logs
+*.log
+logs/
+
+# Runtime data — include sanitized proof of operation
+# operational-log.md  (committed with sanitized sample data only)
+# budget-state.md
+
+# Hermes
+.hermes/
+*.hcl
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
