@@ -1,0 +1,53 @@
+# Hermes Project Configuration for VP Earner (Virtuals Protocol)
+name: "vp-earner"
+description: "Autonomous ACP provider earning via Virtuals Protocol marketplace"
+version: "1.0.0"
+
+# Project paths
+root: "/d/AI-CORE/vp-earner"
+src: "."
+scripts: "."
+config: "."
+tests: "."
+docs: "."
+
+# TypeScript environment
+python: "3.11"
+venv: ""
+requirements: "package.json"
+
+# Environment
+# Credentials are centralized in the Hermes profile .env — no project-level .env needed.
+# Copy .env.example for reference, or run via Hermes profile.
+env_example: ".env.example"
+
+# Cron jobs (managed by Hermes)
+cron_jobs:
+  - name: "vp-cycle"
+    schedule: "*/5 * * * *"  # Every 5 minutes
+    command: "node dist/run-cycle.js"
+    description: "Run one ACP provider earning cycle"
+    enabled: true
+
+# Skills to load
+skills:
+  - "plan"
+  - "test-driven-development"
+  - "systematic-debugging"
+
+# Model configuration
+models:
+  primary: "nvidia/nemotron-3-ultra"
+  provider: "openrouter"
+
+# Telegram delivery
+telegram:
+  bot_token_env: "TELEGRAM_BOT_TOKEN"
+  default_chat_id_env: "TELEGRAM_ADMIN_IDS"
+  delivery_format: "markdown"
+
+# Notifications
+notifications:
+  on_cron_success: false
+  on_cron_failure: true
+  on_cron_timeout: true
