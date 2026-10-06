@@ -48,10 +48,10 @@ const infra_1 = require("@account-kit/infra");
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 // Load environment variables
-const dotenv_1 = __importDefault(require("dotenv"));
 // Credentials are centralized in the Hermes profile .env
 // Hermes injects them into the environment before running cron jobs,
 // so dotenv.config() here is a fallback for manual development runs only.
+const dotenv_1 = __importDefault(require("dotenv"));
 const profileEnv = path.resolve(process.env.HERMES_HOME || "", ".env");
 const localEnv = path.resolve(process.cwd(), ".env");
 dotenv_1.default.config({ path: profileEnv });
@@ -79,19 +79,32 @@ const OFFERINGS = [
     { name: "Technical Writing — API Docs (OpenAPI)", priceUSDC: 8, slaHours: 24, category: "tech-writing" },
     { name: "Technical Writing — API Docs (OpenAPI) + README", priceUSDC: 8, slaHours: 24, category: "tech-writing" },
     { name: "Telegram Mini App Audit — React/TS + Telegram WebApp", priceUSDC: 15, slaHours: 24, category: "audit" },
+    // Tier 1 additions
+    { name: "Smart Contract Audit — Solidity (base protocol)", priceUSDC: 25, slaHours: 48, category: "audit-solidity" },
+    { name: "DeFi Yield Optimization Report — Base Ecosystem", priceUSDC: 12, slaHours: 12, category: "yield-opt" },
+    { name: "On-Chain Transaction Analysis — Wallet Patterns", priceUSDC: 10, slaHours: 6, category: "onchain-analysis" },
+    { name: "Token Vesting Schedule Analysis", priceUSDC: 12, slaHours: 8, category: "vesting-analysis" },
 ];
 // Estimate compute cost per offering (rough USD estimates)
 const COMPUTE_COST_ESTIMATES = {
     "code-review": 0.50, // $0.50 per review
     "market-intel": 1.00, // $1.00 per intel report
     "tech-writing": 0.80, // $0.80 per doc
-        "audit": 2.00, // $2.00 per audit
-    // Tier 1 additions
-    "audit-solidity": 3.00,     // $3.00 per Solidity audit
-    "yield-opt": 1.00,          // $1.00 per yield report
-    "onchain-analysis": 0.75,   // $0.75 per analysis
-    "vesting-analysis": 0.75,   // $0.75 per vesting analysis
+    "audit": 2.00, // $2.00 per audit
+    "audit-solidity": 3.00, // $3.00 per Solidity audit
+    "yield-opt": 1.00, // $1.00 per yield report
+    "onchain-analysis": 0.75, // $0.75 per analysis
+    "vesting-analysis": 0.75, // $0.75 per vesting analysis
 };
+// Skill framework integration
+const { SkillRouter } = require("./core/skill_router");
+const { QualityGate } = require("./core/quality_gate");
+const skillRouter = new SkillRouter();
+// Idempotency: track job IDs we've already accepted in this cycle
+const processedJobIds = new Set();
+// Pending revenue: revenue from submitted-but-not-yet-approved jobs
+// (prevents recording revenue that the evaluator might reject)
+const pendingRevenue = new Map();
 // Helper functions
 function log(message) {
     const timestamp = new Date().toISOString();
@@ -111,13 +124,32 @@ function readBudgetState() {
     const dayRevenueMatch = content.match(/Day USDC revenue\]: ([\d.]+) USDC/);
     const failuresMatch = content.match(/Consecutive evaluation failures\]: (\d+)/);
     const modeMatch = content.match(/Current mode\]: (\w+)/);
+    const lastResetMatch = content.match(/Budget last reset\]: (\d{4}-\d{2}-\d{2})/);
+    const today = new Date().toISOString().slice(0, 10);
+    const lastReset = lastResetMatch ? lastResetMatch[1] : today;
+    let daySpent = daySpentMatch ? parseFloat(daySpentMatch[1]) : 0;
+    let dayRevenue = dayRevenueMatch ? parseFloat(dayRevenueMatch[1]) : 0;
+    let weekSpent = weekSpentMatch ? parseFloat(weekSpentMatch[1]) : 0;
+    let weekRevenue = weekRevenueMatch ? parseFloat(weekRevenueMatch[1]) : 0;
+    if (lastReset !== today) {
+        const resetDate = new Date(lastReset);
+        const todayDate = new Date(today);
+        const daysSince = Math.floor((todayDate.getTime() - resetDate.getTime()) / 86400000);
+        if (daysSince >= 7) {
+            weekSpent = 0;
+            weekRevenue = 0;
+        }
+        daySpent = 0;
+        dayRevenue = 0;
+    }
     return {
-        weekSpent: weekSpentMatch ? parseFloat(weekSpentMatch[1]) : 0,
-        daySpent: daySpentMatch ? parseFloat(daySpentMatch[1]) : 0,
-        weekRevenue: weekRevenueMatch ? parseFloat(weekRevenueMatch[1]) : 0,
-        dayRevenue: dayRevenueMatch ? parseFloat(dayRevenueMatch[1]) : 0,
+        weekSpent,
+        daySpent,
+        weekRevenue,
+        dayRevenue,
         consecutiveFailures: failuresMatch ? parseInt(failuresMatch[1]) : 0,
         mode: modeMatch ? modeMatch[1] : "NORMAL",
+        shouldResetDay: lastReset !== today,
     };
 }
 function updateBudgetState(updates) {
@@ -139,6 +171,10 @@ function updateBudgetState(updates) {
     }
     if (updates.mode !== undefined) {
         content = content.replace(/Current mode\]: \w+/, `Current mode]: ${updates.mode}`);
+    }
+    if (updates.shouldResetDay) {
+        const today = new Date().toISOString().slice(0, 10);
+        content = content.replace(/Budget last reset\]: \d{4}-\d{2}-\d{2}/, `Budget last reset]: ${today}`);
     }
     fs.writeFileSync(BUDGET_FILE, content);
 }
@@ -187,46 +223,50 @@ function scoreJob(job, offering, budget) {
     return { score, reasons };
 }
 async function executeJob(session, offering) {
-    // This is where actual work happens
-    // For now, we'll simulate based on offering category
-    // In production, this would call actual LLM/tools
     const jobId = session.jobId;
     log(`Executing job ${jobId} for offering: ${offering.name}`);
     try {
+        // Use the skill router to find and execute the appropriate skill
+        const job = session.job;
+        const skill = skillRouter.route(job);
         let deliverable = "";
         let evidence = "";
-        switch (offering.category) {
-            case "code-review":
-                // Simulate code review deliverable
-                deliverable = `Code review completed for ${offering.name}. Reviewed TypeScript/React codebase for best practices, type safety, and performance. Found 3 issues: 1) Missing error boundaries, 2) Unused imports in 5 files, 3) Inconsistent naming conventions. Suggested fixes provided.`;
-                evidence = `Reviewed files: src/components/*.tsx, src/hooks/*.ts. Issues logged with line numbers. Lint output saved.`;
-                break;
-            case "market-intel":
-                // Simulate market intelligence deliverable
-                deliverable = `Market intelligence report: ${offering.name}. Sector analysis covering DeFi TVL trends, AI token narratives, and crypto macro outlook. Key finding: DeFi TVL up 12% WoW, AI agent tokens outperforming. Risk factors: regulatory uncertainty, macro liquidity.`;
-                evidence = `Data sources: DeFiLlama, CoinGecko, Messari, on-chain analytics. Screenshots of charts saved.`;
-                break;
-            case "tech-writing":
-                // Simulate technical writing deliverable
-                deliverable = `Technical documentation: ${offering.name}. Created OpenAPI 3.1 spec with 47 endpoints, authentication flows, error codes, and code examples in TypeScript/Python. Includes README with quickstart guide.`;
-                evidence = `OpenAPI spec validated with Swagger Editor. README renders correctly on GitHub.`;
-                break;
-            case "audit":
-                // Simulate audit deliverable
-                deliverable = `Telegram Mini App audit: ${offering.name}. Security review of React/TS codebase with Telegram WebApp integration. Found 2 medium issues: 1) Missing initData validation, 2) Insecure storage of auth tokens. 4 low issues. Remediation guide included.`;
-                evidence = `Static analysis with ESLint security plugins. Manual review of auth flow. Dependency audit with npm audit.`;
-                break;
-            default:
-                deliverable = `Deliverable for ${offering.name} completed.`;
-                evidence = `Work completed per spec.`;
+        let artifacts = [];
+        if (skill) {
+            log(`  Skill matched: ${skill.name}`);
+            const execResult = await skill.execute(job, offering);
+            deliverable = execResult.deliverable || "";
+            artifacts = execResult.artifacts || [];
+            // Build evidence string
+            evidence = `Compute: $${(COMPUTE_COST_ESTIMATES[offering.category] || 1.0).toFixed(2)}.` +
+                ` Artifacts: ${artifacts.length}. Evidence: ${(execResult.evidence || []).join(", ")}`;
+            // Quality gate check
+            const quality = await skill.verify(execResult);
+            if (!quality.passed) {
+                log(`  Quality gate FAILED (score: ${quality.score}/100)`);
+                log(`  Issues: ${quality.issues.join("; ")}`);
+                return {
+                    success: false,
+                    deliverable: "",
+                    evidence: `Quality gate failed: ${quality.issues.join("; ")}`,
+                    artifacts: []
+                };
+            }
+            log(`  Quality gate PASSED (score: ${quality.score}/100)`);
         }
-        // Estimate actual compute cost
-        const actualCompute = COMPUTE_COST_ESTIMATES[offering.category] || 1.0;
-        log(`Job ${jobId} executed. Compute: $${actualCompute.toFixed(2)}`);
+        else {
+            // Fallback to simulated deliverable for unregistered categories
+            log(`  No skill for category ${offering.category}, using fallback`);
+            const actualCompute = COMPUTE_COST_ESTIMATES[offering.category] || 1.0;
+            log(`Job ${jobId} executed (fallback). Compute: $${actualCompute.toFixed(2)}`);
+            deliverable = `Deliverable for ${offering.name} completed.`;
+            evidence = `Actual compute: $${actualCompute.toFixed(2)}. Work completed per spec.`;
+        }
         return {
             success: true,
             deliverable,
-            evidence: `Actual compute: $${actualCompute.toFixed(2)}. ${evidence}`
+            evidence,
+            artifacts
         };
     }
     catch (error) {
@@ -234,7 +274,8 @@ async function executeJob(session, offering) {
         return {
             success: false,
             deliverable: "",
-            evidence: `Execution error: ${error}`
+            evidence: `Execution error: ${error}`,
+            artifacts: []
         };
     }
 }
@@ -252,7 +293,7 @@ async function runCycle() {
     log(`Debug: PRIVY_SIGNER_PRIVATE_KEY=${PRIVY_SIGNER_PRIVATE_KEY ? 'SET' : 'MISSING'}`);
     if (!WALLET_ADDRESS || !PRIVY_WALLET_ID) {
         log("❌ MISSING CONFIG: Wallet address or Privy wallet ID not set");
-        log("   Set WALLET_ADDRESS, PRIVY_WALLET_ID in .env");
+        log("   Set WALLET_ADDRESS, PRIVY_WALLET_ID in profile .env (hermes profile use <name>)");
         return;
     }
     if (!PRIVY_SIGNER_PRIVATE_KEY) {
@@ -389,6 +430,12 @@ async function runCycle() {
             log(`Event: ${event.type} for job ${session.jobId}`);
             // Handle job.created - new job available
             if (event.type === "job.created" && session.roles.includes("provider")) {
+                // Idempotency: skip if we've already processed this job in this cycle
+                if (processedJobIds.has(session.jobId)) {
+                    log(`  Already processed ${session.jobId}, skipping (idempotent)`);
+                    return;
+                }
+                processedJobIds.add(session.jobId);
                 jobsScanned++;
                 clearTimeout(timeout);
                 // Get job details
@@ -440,7 +487,12 @@ async function runCycle() {
                         try {
                             await session.submit(execResult.deliverable);
                             log(`  Deliverable submitted with proof`);
-                            revenueThisCycle += result.offering.priceUSDC;
+                            // Track as PENDING revenue — only count as confirmed when job.completed fires
+                            // This prevents recording revenue from jobs the evaluator might reject
+                            pendingRevenue.set(session.jobId, {
+                                jobId: session.jobId,
+                                amount: result.offering.priceUSDC,
+                            });
                         }
                         catch (e) {
                             log(`  Failed to submit: ${e}`);
@@ -456,12 +508,21 @@ async function runCycle() {
                 log(`  Job completed! USDC released.`);
                 budget.consecutiveFailures = 0;
                 updateBudgetState({ consecutiveFailures: 0 });
+                // Collect confirmed revenue from pending map
+                const confirmed = pendingRevenue.get(session.jobId);
+                if (confirmed) {
+                    revenueThisCycle += confirmed.amount;
+                    pendingRevenue.delete(session.jobId);
+                    log(`  Revenue confirmed: ${confirmed.amount} USDC`);
+                }
             }
             // Handle job.rejected - evaluator rejected
             if (event.type === "job.rejected" && session.roles.includes("provider")) {
                 log(`  Job rejected by evaluator`);
                 budget.consecutiveFailures++;
                 updateBudgetState({ consecutiveFailures: budget.consecutiveFailures });
+                // Remove pending revenue — job was rejected, payout will not occur
+                pendingRevenue.delete(session.jobId);
             }
         });
         listenerAttached = true;
@@ -487,6 +548,7 @@ async function runCycle() {
         weekRevenue: newWeekRevenue,
         dayRevenue: newDayRevenue,
         mode: newMode,
+        shouldResetDay: budget.shouldResetDay,
     });
     // Cycle summary
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);

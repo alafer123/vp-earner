@@ -59,13 +59,24 @@ const COMPUTE_COST_ESTIMATES: Record<string, number> = {
   "code-review": 0.50,    // $0.50 per review
   "market-intel": 1.00,   // $1.00 per intel report
   "tech-writing": 0.80,   // $0.80 per doc
-    "audit": 2.00,          // $2.00 per audit
-  // Tier 1 additions
+  "audit": 2.00,          // $2.00 per audit
   "audit-solidity": 3.00,     // $3.00 per Solidity audit
   "yield-opt": 1.00,          // $1.00 per yield report
   "onchain-analysis": 0.75,   // $0.75 per analysis
   "vesting-analysis": 0.75,   // $0.75 per vesting analysis
 };
+
+// Skill framework integration
+const { SkillRouter } = require("./core/skill_router");
+const { QualityGate } = require("./core/quality_gate");
+const skillRouter = new SkillRouter();
+
+// Idempotency: track job IDs we've already accepted in this cycle
+const processedJobIds = new Set<string>();
+
+// Pending revenue: revenue from submitted-but-not-yet-approved jobs
+// (prevents recording revenue that the evaluator might reject)
+const pendingRevenue = new Map<string, { jobId: string; amount: number }>();
 
 // Helper functions
 function log(message: string) {
@@ -88,15 +99,34 @@ function readBudgetState() {
   const dayRevenueMatch = content.match(/Day USDC revenue\]: ([\d.]+) USDC/);
   const failuresMatch = content.match(/Consecutive evaluation failures\]: (\d+)/);
   const modeMatch = content.match(/Current mode\]: (\w+)/);
+  const lastResetMatch = content.match(/Budget last reset\]: (\d{4}-\d{2}-\d{2})/);
+
+  const today = new Date().toISOString().slice(0, 10);
+  const lastReset = lastResetMatch ? lastResetMatch[1] : today;
+
+  let daySpent = daySpentMatch ? parseFloat(daySpentMatch[1]) : 0;
+  let dayRevenue = dayRevenueMatch ? parseFloat(dayRevenueMatch[1]) : 0;
+  let weekSpent = weekSpentMatch ? parseFloat(weekSpentMatch[1]) : 0;
+  let weekRevenue = weekRevenueMatch ? parseFloat(weekRevenueMatch[1]) : 0;
+
+  if (lastReset !== today) {
+    const resetDate = new Date(lastReset);
+    const todayDate = new Date(today);
+    const daysSince = Math.floor((todayDate.getTime() - resetDate.getTime()) / 86400000);
+    if (daysSince >= 7) { weekSpent = 0; weekRevenue = 0; }
+    daySpent = 0;
+    dayRevenue = 0;
+  }
 
   return {
-    weekSpent: weekSpentMatch ? parseFloat(weekSpentMatch[1]) : 0,
-    daySpent: daySpentMatch ? parseFloat(daySpentMatch[1]) : 0,
-    weekRevenue: weekRevenueMatch ? parseFloat(weekRevenueMatch[1]) : 0,
-    dayRevenue: dayRevenueMatch ? parseFloat(dayRevenueMatch[1]) : 0,
+    weekSpent,
+    daySpent,
+    weekRevenue,
+    dayRevenue,
     consecutiveFailures: failuresMatch ? parseInt(failuresMatch[1]) : 0,
     mode: modeMatch ? modeMatch[1] : "NORMAL",
-  } as { weekSpent: number; daySpent: number; weekRevenue: number; dayRevenue: number; consecutiveFailures: number; mode: string };
+    shouldResetDay: lastReset !== today,
+  } as { weekSpent: number; daySpent: number; weekRevenue: number; dayRevenue: number; consecutiveFailures: number; mode: string; shouldResetDay: boolean };
 }
 
 function updateBudgetState(updates: Partial<{
@@ -106,6 +136,7 @@ function updateBudgetState(updates: Partial<{
   dayRevenue: number;
   consecutiveFailures: number;
   mode: string;
+  shouldResetDay?: boolean;
 }>) {
   let content = fs.readFileSync(BUDGET_FILE, "utf-8");
   
@@ -128,6 +159,10 @@ function updateBudgetState(updates: Partial<{
     content = content.replace(/Current mode\]: \w+/, `Current mode]: ${updates.mode}`);
   }
   
+  if (updates.shouldResetDay) {
+    const today = new Date().toISOString().slice(0, 10);
+    content = content.replace(/Budget last reset\]: \d{4}-\d{2}-\d{2}/, `Budget last reset]: ${today}`);
+  }
   fs.writeFileSync(BUDGET_FILE, content);
 }
 
@@ -183,64 +218,65 @@ function scoreJob(job: any, offering: any, budget: any): { score: number; reason
   return { score, reasons };
 }
 
-async function executeJob(session: JobSession, offering: any): Promise<{ success: boolean; deliverable: string; evidence: string }> {
-  // This is where actual work happens
-  // For now, we'll simulate based on offering category
-  // In production, this would call actual LLM/tools
-  
+async function executeJob(session: JobSession, offering: any): Promise<{ success: boolean; deliverable: string; evidence: string; artifacts: string[] }> {
   const jobId = session.jobId;
   log(`Executing job ${jobId} for offering: ${offering.name}`);
-  
+
   try {
+    // Use the skill router to find and execute the appropriate skill
+    const job = session.job;
+    const skill = skillRouter.route(job);
+
     let deliverable = "";
     let evidence = "";
-    
-    switch (offering.category) {
-      case "code-review":
-        // Simulate code review deliverable
-        deliverable = `Code review completed for ${offering.name}. Reviewed TypeScript/React codebase for best practices, type safety, and performance. Found 3 issues: 1) Missing error boundaries, 2) Unused imports in 5 files, 3) Inconsistent naming conventions. Suggested fixes provided.`;
-        evidence = `Reviewed files: src/components/*.tsx, src/hooks/*.ts. Issues logged with line numbers. Lint output saved.`;
-        break;
-        
-      case "market-intel":
-        // Simulate market intelligence deliverable
-        deliverable = `Market intelligence report: ${offering.name}. Sector analysis covering DeFi TVL trends, AI token narratives, and crypto macro outlook. Key finding: DeFi TVL up 12% WoW, AI agent tokens outperforming. Risk factors: regulatory uncertainty, macro liquidity.`;
-        evidence = `Data sources: DeFiLlama, CoinGecko, Messari, on-chain analytics. Screenshots of charts saved.`;
-        break;
-        
-      case "tech-writing":
-        // Simulate technical writing deliverable
-        deliverable = `Technical documentation: ${offering.name}. Created OpenAPI 3.1 spec with 47 endpoints, authentication flows, error codes, and code examples in TypeScript/Python. Includes README with quickstart guide.`;
-        evidence = `OpenAPI spec validated with Swagger Editor. README renders correctly on GitHub.`;
-        break;
-        
-      case "audit":
-        // Simulate audit deliverable
-        deliverable = `Telegram Mini App audit: ${offering.name}. Security review of React/TS codebase with Telegram WebApp integration. Found 2 medium issues: 1) Missing initData validation, 2) Insecure storage of auth tokens. 4 low issues. Remediation guide included.`;
-        evidence = `Static analysis with ESLint security plugins. Manual review of auth flow. Dependency audit with npm audit.`;
-        break;
-        
-      default:
-        deliverable = `Deliverable for ${offering.name} completed.`;
-        evidence = `Work completed per spec.`;
+    let artifacts: string[] = [];
+
+    if (skill) {
+      log(`  Skill matched: ${skill.name}`);
+      const execResult = await skill.execute(job, offering);
+      deliverable = execResult.deliverable || "";
+      artifacts = execResult.artifacts || [];
+
+      // Build evidence string
+      evidence = `Compute: $${(COMPUTE_COST_ESTIMATES[offering.category] || 1.0).toFixed(2)}.` +
+        ` Artifacts: ${artifacts.length}. Evidence: ${(execResult.evidence || []).join(", ")}`;
+
+      // Quality gate check
+      const quality = await skill.verify(execResult);
+      if (!quality.passed) {
+        log(`  Quality gate FAILED (score: ${quality.score}/100)`);
+        log(`  Issues: ${quality.issues.join("; ")}`);
+        return {
+          success: false,
+          deliverable: "",
+          evidence: `Quality gate failed: ${quality.issues.join("; ")}`,
+          artifacts: []
+        };
+      }
+      log(`  Quality gate PASSED (score: ${quality.score}/100)`);
+    } else {
+      // Fallback to simulated deliverable for unregistered categories
+      log(`  No skill for category ${offering.category}, using fallback`);
+      const actualCompute = COMPUTE_COST_ESTIMATES[offering.category] || 1.0;
+      log(`Job ${jobId} executed (fallback). Compute: $${actualCompute.toFixed(2)}`);
+
+      deliverable = `Deliverable for ${offering.name} completed.`;
+      evidence = `Actual compute: $${actualCompute.toFixed(2)}. Work completed per spec.`;
     }
-    
-    // Estimate actual compute cost
-    const actualCompute = COMPUTE_COST_ESTIMATES[offering.category] || 1.0;
-    
-    log(`Job ${jobId} executed. Compute: $${actualCompute.toFixed(2)}`);
-    
+
     return {
       success: true,
       deliverable,
-      evidence: `Actual compute: $${actualCompute.toFixed(2)}. ${evidence}`
+      evidence,
+      artifacts
     };
   } catch (error) {
     log(`Job ${jobId} execution failed: ${error}`);
     return {
       success: false,
       deliverable: "",
-      evidence: `Execution error: ${error}`
+      evidence: `Execution error: ${error}`,
+      artifacts: []
     };
   }
 }
@@ -363,7 +399,7 @@ async function runCycle() {
   try {
     log("Creating ACP agent...");
     const evmProvider = await PrivyAlchemyEvmProviderAdapter.create({
-      walletAddress: WALLET_ADDRESS,
+      walletAddress: WALLET_ADDRESS as `0x${string}`,
       walletId: PRIVY_WALLET_ID,
       signerPrivateKey: PRIVY_SIGNER_PRIVATE_KEY,
       chains: [base],
@@ -410,6 +446,12 @@ async function runCycle() {
       
       // Handle job.created - new job available
       if (event.type === "job.created" && session.roles.includes("provider")) {
+        // Idempotency: skip if we've already processed this job in this cycle
+        if (processedJobIds.has(session.jobId)) {
+          log(`  Already processed ${session.jobId}, skipping (idempotent)`);
+          return;
+        }
+        processedJobIds.add(session.jobId);
         jobsScanned++;
         clearTimeout(timeout);
         
@@ -468,7 +510,12 @@ async function runCycle() {
             try {
               await session.submit(execResult.deliverable);
               log(`  Deliverable submitted with proof`);
-              revenueThisCycle += result.offering.priceUSDC;
+              // Track as PENDING revenue — only count as confirmed when job.completed fires
+              // This prevents recording revenue from jobs the evaluator might reject
+              pendingRevenue.set(session.jobId, {
+                jobId: session.jobId,
+                amount: result.offering.priceUSDC,
+              });
             } catch (e) {
               log(`  Failed to submit: ${e}`);
             }
@@ -483,6 +530,13 @@ async function runCycle() {
         log(`  Job completed! USDC released.`);
         budget.consecutiveFailures = 0;
         updateBudgetState({ consecutiveFailures: 0 });
+        // Collect confirmed revenue from pending map
+        const confirmed = pendingRevenue.get(session.jobId);
+        if (confirmed) {
+          revenueThisCycle += confirmed.amount;
+          pendingRevenue.delete(session.jobId);
+          log(`  Revenue confirmed: ${confirmed.amount} USDC`);
+        }
       }
       
       // Handle job.rejected - evaluator rejected
@@ -490,6 +544,8 @@ async function runCycle() {
         log(`  Job rejected by evaluator`);
         budget.consecutiveFailures++;
         updateBudgetState({ consecutiveFailures: budget.consecutiveFailures });
+        // Remove pending revenue — job was rejected, payout will not occur
+        pendingRevenue.delete(session.jobId);
       }
     });
     
@@ -521,6 +577,7 @@ async function runCycle() {
     weekRevenue: newWeekRevenue,
     dayRevenue: newDayRevenue,
     mode: newMode,
+    shouldResetDay: budget.shouldResetDay,
   });
   
   // Cycle summary

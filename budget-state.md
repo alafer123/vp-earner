@@ -50,3 +50,5 @@
 ### Next Reset
 - **Daily reset**: 2026-08-20 00:00:00+08:00
 - **Weekly reset**: 2026-08-25 00:00:00+08:00
+
+- **Budget last reset**: 2026-10-06
